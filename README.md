@@ -16,7 +16,8 @@ Internal FastAPI service that powers document Q&A for Droply. It ingests user fi
 
 - Download and chunk documents from a signed/public URL
 - Upsert embeddings into `document_chunks` (scoped by `user_id` + `file_id`)
-- Similarity retrieval across a user's full indexed library
+- Similarity retrieval across a user's full indexed library (optional `file_ids` scope)
+- **Corrective RAG (CRAG):** LLM relevance grading of retrieved chunks; if all score below the threshold, fall back to web search
 - Streaming chat responses (`meta` → `token` → `done` / `error`)
 - Internal API auth via shared bearer key
 
@@ -53,6 +54,9 @@ Fill in `.env` before starting the service.
 | `RAG_INTERNAL_KEY` | Yes | Shared secret; callers must send `Authorization: Bearer <key>` |
 | `GROQ_CHAT_MODEL` | No | Chat model (default: `llama-3.1-8b-instant`) |
 | `RAG_TOP_K` | No | Number of chunks retrieved per query (default: `8`) |
+| `CRAG_ENABLED` | No | Enable Corrective RAG web fallback (default: `1`) |
+| `CRAG_RELEVANCE_THRESHOLD` | No | Min chunk relevance % to keep docs (default: `50`) |
+| `WEB_SEARCH_RESULTS` | No | Web results to fetch on fallback (default: `5`) |
 | `PORT` | No | Listen port for Docker / Procfile (default: `8001`) |
 
 ## Run locally
@@ -128,18 +132,23 @@ Library-wide Q&A for a user. Returns an SSE stream.
   "history": [
     { "role": "user", "content": "Summarize the intro" },
     { "role": "assistant", "content": "..." }
-  ]
+  ],
+  "file_ids": ["uuid-optional", "uuid-optional"]
 }
 ```
+
+`file_ids` is optional. Omit or pass `[]` to search the user’s full indexed library; pass specific IDs to scope retrieval to those files only.
 
 **SSE events**
 
 | Event | Payload | When |
 | --- | --- | --- |
-| `meta` | `{ "sources": [...] }` | After retrieval, before tokens |
+| `meta` | `{ "mode", "sources", "relevance?", "message?" }` | After retrieve/grade (and again after web search) |
 | `token` | `{ "text": "..." }` | Each streamed completion delta |
-| `done` | `{ "sources": [...] }` | Stream finished |
+| `done` | `{ "mode", "sources", "relevance?" }` | Stream finished |
 | `error` | `{ "message": "..." }` | Failure during chat |
+
+`mode` is `"documents"` when answering from indexed files, or `"web"` when CRAG fell back to search because every chunk scored below `CRAG_RELEVANCE_THRESHOLD`.
 
 Example:
 

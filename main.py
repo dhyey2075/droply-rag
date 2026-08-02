@@ -31,6 +31,15 @@ EMBEDDING_MODEL = "gemini-embedding-001"
 # Chat via Groq (Gemini free-tier generate quota is exhausted)
 CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.1-8b-instant")
 RETRIEVAL_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
+# CRAG: if every chunk scores below this (%), fall back to web search
+CRAG_RELEVANCE_THRESHOLD = float(os.getenv("CRAG_RELEVANCE_THRESHOLD", "50"))
+WEB_SEARCH_RESULTS = int(os.getenv("WEB_SEARCH_RESULTS", "5"))
+CRAG_ENABLED = os.getenv("CRAG_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 
 class IngestRequest(BaseModel):
@@ -55,6 +64,9 @@ class ChatRequest(BaseModel):
     user_id: str
     question: str = Field(min_length=1)
     history: list[ChatHistoryItem] = Field(default_factory=list)
+    # Optional scope: when set, retrieve only from these file_ids (still user-scoped).
+    # Omit / empty = search all of the user's indexed documents.
+    file_ids: list[str] = Field(default_factory=list)
 
 
 def require_internal_key(
@@ -166,27 +178,52 @@ def embed_texts(
     return vectors
 
 
-def retrieve_chunks(user_id: str, query_vector: list[float], k: int) -> list[dict[str, Any]]:
+def retrieve_chunks(
+    user_id: str,
+    query_vector: list[float],
+    k: int,
+    file_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
     vector_literal = "[" + ",".join(str(float(x)) for x in query_vector) + "]"
+    scoped_ids = [fid for fid in (file_ids or []) if fid and fid.strip()]
     db_url = get_db_url()
     with psycopg.connect(db_url) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    id::text,
-                    file_id::text,
-                    chunk_index,
-                    content,
-                    metadata,
-                    embedding <=> %s::vector AS distance
-                FROM document_chunks
-                WHERE user_id = %s
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (vector_literal, user_id, vector_literal, k),
-            )
+            if scoped_ids:
+                cur.execute(
+                    """
+                    SELECT
+                        id::text,
+                        file_id::text,
+                        chunk_index,
+                        content,
+                        metadata,
+                        embedding <=> %s::vector AS distance
+                    FROM document_chunks
+                    WHERE user_id = %s
+                      AND file_id = ANY(%s::uuid[])
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (vector_literal, user_id, scoped_ids, vector_literal, k),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        id::text,
+                        file_id::text,
+                        chunk_index,
+                        content,
+                        metadata,
+                        embedding <=> %s::vector AS distance
+                    FROM document_chunks
+                    WHERE user_id = %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (vector_literal, user_id, vector_literal, k),
+                )
             rows = cur.fetchall()
 
     results: list[dict[str, Any]] = []
@@ -258,6 +295,144 @@ def build_sources(user_id: str, chunks: list[dict[str, Any]]) -> list[dict[str, 
                 "fileId": file_id,
                 "fileName": file_name,
                 "fileUrl": file_url,
+                "snippet": snippet,
+            }
+        )
+    return sources
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(raw[start : end + 1])
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def grade_chunk_relevance(
+    groq_client: Groq,
+    question: str,
+    chunks: list[dict[str, Any]],
+) -> list[float]:
+    """Score each chunk 0–100 for relevance to the question (Corrective RAG)."""
+    if not chunks:
+        return []
+
+    numbered: list[str] = []
+    for i, chunk in enumerate(chunks, start=1):
+        text = (chunk.get("content") or "").strip().replace("\n", " ")
+        if len(text) > 500:
+            text = text[:497] + "..."
+        source = chunk.get("file_name") or "document"
+        numbered.append(f"[{i}] ({source}) {text}")
+
+    prompt = (
+        "You are a retrieval relevance grader for Corrective RAG (CRAG).\n"
+        "Score how relevant EACH document chunk is to answering the question.\n"
+        "Return ONLY valid JSON with this exact shape:\n"
+        '{"scores":[number, number, ...]}\n'
+        "Each score must be from 0 to 100 (percent). "
+        f"Provide exactly {len(chunks)} scores in the same order as the chunks.\n"
+        "Guidelines: 80–100 strongly answers the question; 50–79 partially useful; "
+        "0–49 mostly irrelevant or off-topic.\n\n"
+        f"Question: {question}\n\n"
+        "Chunks:\n"
+        + "\n".join(numbered)
+    )
+
+    completion = groq_client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "You output only compact JSON. No markdown fences.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
+    )
+    content = completion.choices[0].message.content or ""
+    parsed = _extract_json_object(content)
+    if not parsed or "scores" not in parsed:
+        raise ValueError(f"Relevance grader returned unusable JSON: {content[:200]}")
+
+    raw_scores = parsed["scores"]
+    if not isinstance(raw_scores, list) or len(raw_scores) != len(chunks):
+        raise ValueError(
+            f"Expected {len(chunks)} scores, got "
+            f"{len(raw_scores) if isinstance(raw_scores, list) else type(raw_scores)}"
+        )
+
+    scores: list[float] = []
+    for value in raw_scores:
+        try:
+            score = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid relevance score: {value}") from exc
+        scores.append(max(0.0, min(100.0, score)))
+    return scores
+
+
+def web_search(query: str, max_results: int = WEB_SEARCH_RESULTS) -> list[dict[str, str]]:
+    """CRAG web fallback via DDGS (no API key required)."""
+    try:
+        from ddgs import DDGS
+    except ImportError as exc:  # pragma: no cover
+        raise HTTPException(
+            status_code=500,
+            detail="Web search package 'ddgs' is not installed",
+        ) from exc
+
+    try:
+        results = DDGS().text(query, max_results=max_results) or []
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=f"Web search failed: {exc}",
+        ) from exc
+
+    cleaned: list[dict[str, str]] = []
+    for item in results:
+        title = (item.get("title") or "Web result").strip()
+        href = (item.get("href") or item.get("link") or "").strip()
+        body = (item.get("body") or item.get("snippet") or "").strip()
+        if not href and not body:
+            continue
+        cleaned.append({"title": title, "href": href, "body": body})
+    return cleaned
+
+
+def build_web_context(results: list[dict[str, str]]) -> str:
+    blocks: list[str] = []
+    for i, item in enumerate(results, start=1):
+        blocks.append(
+            f"[{i}] {item['title']}\nURL: {item['href']}\n{item['body']}"
+        )
+    return "\n\n".join(blocks)
+
+
+def build_web_sources(results: list[dict[str, str]]) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for i, item in enumerate(results, start=1):
+        snippet = item["body"].replace("\n", " ")
+        if len(snippet) > 180:
+            snippet = snippet[:177] + "..."
+        sources.append(
+            {
+                "fileId": f"web-{i}",
+                "fileName": item["title"] or f"Web result {i}",
+                "fileUrl": item["href"],
                 "snippet": snippet,
             }
         )
@@ -435,27 +610,120 @@ async def chat(
                 [question],
                 task_type="RETRIEVAL_QUERY",
             )[0]
-            chunks = retrieve_chunks(payload.user_id, query_vec, RETRIEVAL_TOP_K)
-            sources = build_sources(payload.user_id, chunks)
-            yield sse("meta", {"sources": sources})
-
-            if not chunks:
-                fallback = (
-                    "I couldn't find relevant information in your indexed documents "
-                    "for that question."
-                )
-                yield sse("token", {"text": fallback})
-                yield sse("done", {"sources": sources})
-                return
-
-            context = build_context(chunks)
-            system_instruction = (
-                "You are Droply's document assistant. Answer using ONLY the provided "
-                "context from the user's documents. If the context is insufficient, "
-                "say you don't know based on the available documents. Be concise. "
-                "When citing, use only the human-readable filename (e.g. Resume.pdf). "
-                "Never mention file_id, chunk numbers, UUIDs, or internal IDs."
+            scoped_file_ids = [
+                fid.strip() for fid in payload.file_ids if fid and fid.strip()
+            ]
+            chunks = retrieve_chunks(
+                payload.user_id,
+                query_vec,
+                RETRIEVAL_TOP_K,
+                file_ids=scoped_file_ids or None,
             )
+
+            mode: Literal["documents", "web"] = "documents"
+            relevance: list[dict[str, Any]] = []
+            sources: list[dict[str, Any]] = []
+            context = ""
+            system_instruction = ""
+
+            # --- Corrective RAG (CRAG) ---
+            # Grade retrieved chunks; if all < threshold, answer via web search.
+            use_web = False
+            relevant_chunks = chunks
+
+            if CRAG_ENABLED:
+                if not chunks:
+                    use_web = True
+                else:
+                    try:
+                        scores = grade_chunk_relevance(groq_client, question, chunks)
+                        relevance = [
+                            {
+                                "fileName": c.get("file_name") or "document",
+                                "chunkIndex": c.get("chunk_index"),
+                                "score": score,
+                            }
+                            for c, score in zip(chunks, scores, strict=True)
+                        ]
+                        relevant_chunks = [
+                            c
+                            for c, score in zip(chunks, scores, strict=True)
+                            if score >= CRAG_RELEVANCE_THRESHOLD
+                        ]
+                        use_web = len(relevant_chunks) == 0
+                    except Exception as grade_exc:  # noqa: BLE001
+                        # Fail open to document RAG if the grader errors
+                        print(f"CRAG grading failed, using documents: {grade_exc}")
+                        use_web = False
+                        relevant_chunks = chunks
+
+            if use_web:
+                mode = "web"
+                yield sse(
+                    "meta",
+                    {
+                        "mode": mode,
+                        "sources": [],
+                        "relevance": relevance,
+                        "message": "Documents were not relevant enough; searching the web…",
+                    },
+                )
+                web_results = web_search(question, max_results=WEB_SEARCH_RESULTS)
+                sources = build_web_sources(web_results)
+                yield sse(
+                    "meta",
+                    {
+                        "mode": mode,
+                        "sources": sources,
+                        "relevance": relevance,
+                    },
+                )
+
+                if not web_results:
+                    fallback = (
+                        "I couldn't find relevant information in your documents "
+                        "or on the web for that question."
+                    )
+                    yield sse("token", {"text": fallback})
+                    yield sse("done", {"mode": mode, "sources": sources, "relevance": relevance})
+                    return
+
+                context = build_web_context(web_results)
+                system_instruction = (
+                    "You are Droply's assistant in web-fallback mode (Corrective RAG). "
+                    "The user's documents were not relevant enough, so answer using ONLY "
+                    "the web search results below. Be concise and factual. "
+                    "Cite sources by page title. If results are insufficient, say so."
+                )
+            else:
+                mode = "documents"
+                sources = build_sources(payload.user_id, relevant_chunks)
+                yield sse(
+                    "meta",
+                    {
+                        "mode": mode,
+                        "sources": sources,
+                        "relevance": relevance,
+                    },
+                )
+
+                if not relevant_chunks:
+                    fallback = (
+                        "I couldn't find relevant information in your indexed documents "
+                        "for that question."
+                    )
+                    yield sse("token", {"text": fallback})
+                    yield sse("done", {"mode": mode, "sources": sources, "relevance": relevance})
+                    return
+
+                context = build_context(relevant_chunks)
+                system_instruction = (
+                    "You are Droply's document assistant. Answer using ONLY the provided "
+                    "context from the user's documents. If the context is insufficient, "
+                    "say you don't know based on the available documents. Be concise. "
+                    "When citing, use only the human-readable filename (e.g. Resume.pdf). "
+                    "Never mention file_id, chunk numbers, UUIDs, or internal IDs."
+                )
 
             messages: list[dict[str, str]] = [
                 {"role": "system", "content": system_instruction},
@@ -489,7 +757,10 @@ async def chat(
                 if delta:
                     yield sse("token", {"text": delta})
 
-            yield sse("done", {"sources": sources})
+            yield sse(
+                "done",
+                {"mode": mode, "sources": sources, "relevance": relevance},
+            )
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, str) else "Chat failed"
             yield sse("error", {"message": detail})

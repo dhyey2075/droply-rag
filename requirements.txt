@@ -10,3 +10,5 @@ langchain-community>=0.3.0
 langchain-text-splitters>=0.3.0
 pypdf>=5.0.0
 docx2txt>=0.8
+ddgs>=9.0.0
+
