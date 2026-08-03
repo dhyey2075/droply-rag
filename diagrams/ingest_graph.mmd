@@ -1,0 +1,24 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	validate(validate)
+	download(download)
+	parse(parse)
+	chunk(chunk)
+	embed_docs(embed_docs)
+	upsert(upsert)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> validate;
+	chunk --> embed_docs;
+	download --> parse;
+	embed_docs --> upsert;
+	parse --> chunk;
+	validate --> download;
+	upsert --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc

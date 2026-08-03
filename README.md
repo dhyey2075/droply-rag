@@ -7,10 +7,46 @@ Internal FastAPI service that powers document Q&A for Droply. It ingests user fi
 | Layer | Technology |
 | --- | --- |
 | API | FastAPI + Uvicorn |
+| Orchestration | **LangGraph** StateGraphs (ingest + CRAG chat) |
 | Embeddings | Google Gemini (`gemini-embedding-001`, 768 dims) |
-| Chat | Groq (`llama-3.1-8b-instant` by default) |
+| Chat | Groq (configurable; default `llama-3.1-8b-instant`) |
 | Vector store | PostgreSQL + `pgvector` |
 | Document loaders | LangChain (PDF, DOCX, TXT, and related text types) |
+| Web fallback | DDGS (Corrective RAG) |
+
+## Architecture
+
+Pipelines are modular LangGraph nodes. FastAPI only handles HTTP/SSE.
+
+### Chat (CRAG)
+
+```text
+embed_query → retrieve → grade_documents
+                              ├─ prepare_documents → build_prompt → (stream tokens)
+                              └─ refine_query → web_search → prepare_web → build_prompt → (stream tokens)
+```
+
+`refine_query` rewrites the user question (using recent chat history) into a self-contained, search-engine-friendly query before DDGS web search.
+
+![Chat CRAG LangGraph](diagrams/chat_crag_graph.png)
+
+### Ingest
+
+```text
+validate → download → parse → chunk → embed_docs → upsert
+```
+
+![Ingest LangGraph](diagrams/ingest_graph.png)
+
+### Regenerating diagrams
+
+```bash
+python export_graphs.py
+```
+
+Outputs land in `diagrams/`:
+- `chat_crag_graph.png` / `.mmd`
+- `ingest_graph.png` / `.mmd`
 
 ## Features
 
@@ -20,6 +56,7 @@ Internal FastAPI service that powers document Q&A for Droply. It ingests user fi
 - **Corrective RAG (CRAG):** LLM relevance grading of retrieved chunks; if all score below the threshold, fall back to web search
 - Streaming chat responses (`meta` → `token` → `done` / `error`)
 - Internal API auth via shared bearer key
+- Node-wise LangGraph structure for readability and testing
 
 ## Requirements
 
@@ -163,7 +200,26 @@ curl -N http://localhost:8001/chat \
 
 ```text
 droply-rag/
-├── main.py            # FastAPI app (ingest + chat)
+├── main.py                 # FastAPI shell (/health, /ingest, /chat)
+├── app/
+│   ├── config.py
+│   ├── auth.py
+│   ├── models.py
+│   ├── clients.py
+│   ├── sse.py
+│   ├── chat/               # CRAG LangGraph
+│   │   ├── state.py
+│   │   ├── nodes.py
+│   │   ├── routing.py
+│   │   └── graph.py
+│   ├── ingest/             # Linear ingest LangGraph
+│   │   ├── state.py
+│   │   ├── loaders.py
+│   │   ├── nodes.py
+│   │   └── graph.py
+│   ├── retrieval/          # embeddings, pgvector, sources
+│   ├── grading/            # CRAG relevance grader
+│   └── search/             # DDGS web fallback
 ├── requirements.txt
 ├── Dockerfile
 ├── Procfile
@@ -174,5 +230,5 @@ droply-rag/
 ## Notes
 
 - Intended as an **internal** service called by the Droply backend — do not expose publicly without additional auth.
-- Answers are grounded only in retrieved document context; the model is instructed not to invent content outside that context.
+- In **documents** mode, answers are grounded only in retrieved context. In **web** mode (CRAG fallback), answers use search results instead.
 - Supported ingest types are inferred from filename extension / MIME (PDF, DOCX, TXT, MD, CSV, and similar text formats).
