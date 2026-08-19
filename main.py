@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from app.auth import require_internal_key
 from app.chat.graph import chat_graph
+from app.chat.status import GRAPH_STATUS_STEPS, status_message_for
 from app.clients import get_groq_client
 from app.config import CHAT_MODEL
 from app.ingest.graph import ingest_graph
@@ -57,32 +58,42 @@ async def chat(
                 {"role": turn.role, "content": turn.content}
                 for turn in payload.history
             ]
-            # Run CRAG graph through build_prompt (control flow + context prep).
-            final: dict[str, Any] = await chat_graph.ainvoke(
-                {
-                    "user_id": payload.user_id,
-                    "question": question,
-                    "history": history,
-                    "file_ids": payload.file_ids or [],
-                }
+            graph_input: dict[str, Any] = {
+                "user_id": payload.user_id,
+                "question": question,
+                "history": history,
+                "file_ids": payload.file_ids or [],
+            }
+
+            yield sse(
+                "status",
+                {"step": "start", "message": status_message_for("start")},
             )
+
+            final: dict[str, Any] = dict(graph_input)
+            async for update in chat_graph.astream(
+                graph_input,
+                stream_mode="updates",
+            ):
+                if not isinstance(update, dict):
+                    continue
+                for step, patch in update.items():
+                    if isinstance(patch, dict):
+                        final.update(patch)
+                    step_name = str(step)
+                    if step_name not in GRAPH_STATUS_STEPS:
+                        continue
+                    yield sse(
+                        "status",
+                        {
+                            "step": step_name,
+                            "message": status_message_for(step_name, final),
+                        },
+                    )
 
             mode = final.get("mode") or "documents"
             sources = final.get("sources") or []
             relevance = final.get("relevance") or []
-            meta_message = final.get("meta_message")
-
-            # Mirror prior UX: announce web fallback before sources when needed.
-            if mode == "web" and meta_message:
-                yield sse(
-                    "meta",
-                    {
-                        "mode": mode,
-                        "sources": [],
-                        "relevance": relevance,
-                        "message": meta_message,
-                    },
-                )
 
             yield sse(
                 "meta",
@@ -90,7 +101,6 @@ async def chat(
                     "mode": mode,
                     "sources": sources,
                     "relevance": relevance,
-                    **({"message": meta_message} if meta_message and mode != "web" else {}),
                 },
             )
 
@@ -114,6 +124,11 @@ async def chat(
                     {"mode": mode, "sources": sources, "relevance": relevance},
                 )
                 return
+
+            yield sse(
+                "status",
+                {"step": "generate", "message": status_message_for("generate")},
+            )
 
             groq_client = get_groq_client()
             stream = groq_client.chat.completions.create(

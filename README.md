@@ -9,7 +9,7 @@ Internal FastAPI service that powers document Q&A for Droply. It ingests user fi
 | API | FastAPI + Uvicorn |
 | Orchestration | **LangGraph** StateGraphs (ingest + CRAG chat) |
 | Embeddings | Google Gemini (`gemini-embedding-001`, 768 dims) |
-| Chat | Groq (configurable; default `llama-3.1-8b-instant`) |
+| Chat | Groq (configurable; default `openai/gpt-oss-20b`) |
 | Vector store | PostgreSQL + `pgvector` |
 | Document loaders | LangChain (PDF, DOCX, TXT, and related text types) |
 | Web fallback | DDGS (Corrective RAG) |
@@ -89,7 +89,7 @@ Fill in `.env` before starting the service.
 | `GEMINI_API_KEY` | Yes | Gemini API key for embeddings (`GOOGLE_API_KEY` also accepted) |
 | `GROQ_API_KEY` | Yes | Groq API key for chat completions |
 | `RAG_INTERNAL_KEY` | Yes | Shared secret; callers must send `Authorization: Bearer <key>` |
-| `GROQ_CHAT_MODEL` | No | Chat model (default: `llama-3.1-8b-instant`) |
+| `GROQ_CHAT_MODEL` | No | Chat model (default: `openai/gpt-oss-20b`) |
 | `RAG_TOP_K` | No | Number of chunks retrieved per query (default: `8`) |
 | `CRAG_ENABLED` | No | Enable Corrective RAG web fallback (default: `1`) |
 | `CRAG_RELEVANCE_THRESHOLD` | No | Min chunk relevance % to keep docs (default: `50`) |
@@ -180,10 +180,13 @@ Library-wide Q&A for a user. Returns an SSE stream.
 
 | Event | Payload | When |
 | --- | --- | --- |
-| `meta` | `{ "mode", "sources", "relevance?", "message?" }` | After retrieve/grade (and again after web search) |
+| `status` | `{ "step", "message" }` | Live progress as each chat-graph node finishes (and once before Groq tokens) |
+| `meta` | `{ "mode", "sources", "relevance?" }` | After the graph finishes (sources / mode ready) |
 | `token` | `{ "text": "..." }` | Each streamed completion delta |
 | `done` | `{ "mode", "sources", "relevance?" }` | Stream finished |
 | `error` | `{ "message": "..." }` | Failure during chat |
+
+`status.step` is a graph node id (`embed_query`, `retrieve`, `grade_documents`, `prepare_documents`, `refine_query`, `web_search`, `prepare_web`, `build_prompt`) plus `start` (before the graph) and `generate` (Groq stream about to begin). `message` is the user-facing phrase for the Ask UI.
 
 `mode` is `"documents"` when answering from indexed files, or `"web"` when CRAG fell back to search because every chunk scored below `CRAG_RELEVANCE_THRESHOLD`.
 
