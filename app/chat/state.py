@@ -18,6 +18,7 @@ class ChatState(TypedDict, total=False):
     file_ids: list[str]
 
     # Working
+    intent: Literal["direct", "retrieve"]
     query_vector: list[float]
     chunks: list[dict[str, Any]]
     relevance: list[dict[str, Any]]
@@ -25,7 +26,7 @@ class ChatState(TypedDict, total=False):
     use_web: bool
     refined_query: str
     web_results: list[dict[str, str]]
-    mode: Literal["documents", "web"]
+    mode: Literal["documents", "web", "chat"]
     sources: list[dict[str, Any]]
     context: str
     system_instruction: str

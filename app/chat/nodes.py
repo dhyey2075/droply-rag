@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.chat.intent import classify_intent, heuristic_intent
 from app.chat.state import ChatState
 from app.clients import get_gemini_client, get_groq_client
 from app.config import CHAT_MODEL, CRAG_ENABLED, CRAG_RELEVANCE_THRESHOLD, RETRIEVAL_TOP_K
@@ -17,6 +18,44 @@ from app.retrieval.sources import (
 )
 from app.retrieval.vectorstore import retrieve_chunks
 from app.search.web import web_search
+
+
+def route_intent(state: ChatState) -> dict[str, Any]:
+    """Skip retrieval for greetings, capability questions, and other chit-chat."""
+    history = state.get("history") or []
+    guessed = heuristic_intent(state["question"], history)
+    if guessed is not None:
+        return {"intent": guessed}
+    try:
+        intent = classify_intent(
+            get_groq_client(),
+            state["question"],
+            history,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Intent classify failed, retrieving: {exc}")
+        intent = "retrieve"
+    return {"intent": intent}
+
+
+def prepare_direct(_state: ChatState) -> dict[str, Any]:
+    return {
+        "mode": "chat",
+        "sources": [],
+        "context": "",
+        "system_instruction": (
+            "You are Droply, a file-library assistant. You can answer questions "
+            "about the user's uploaded documents and, if those are not relevant, "
+            "search the web. This turn does not use documents or web search — "
+            "reply from conversation only. Be friendly and concise. "
+            "If they ask what you can do, explain that they can ask about their "
+            "files and you will search documents first, then the web if needed. "
+            "Do not invent contents of their files. "
+            "Format in Markdown when listing capabilities. "
+            "Do not wrap the whole answer in a code fence."
+        ),
+        "fallback_text": None,
+    }
 
 
 def embed_query(state: ChatState) -> dict[str, Any]:
@@ -117,7 +156,9 @@ def prepare_documents(state: ChatState) -> dict[str, Any]:
             "context from the user's documents. If the context is insufficient, "
             "say you don't know based on the available documents. Be concise. "
             "When citing, use only the human-readable filename (e.g. Resume.pdf). "
-            "Never mention file_id, chunk numbers, UUIDs, or internal IDs."
+            "Never mention file_id, chunk numbers, UUIDs, or internal IDs. "
+            "Format in Markdown: headings, **bold**, and bullet/numbered lists. "
+            "Do not wrap the whole answer in a code fence."
         ),
         "fallback_text": None,
     }
@@ -213,7 +254,9 @@ def prepare_web(state: ChatState) -> dict[str, Any]:
             "You are Droply's assistant in web-fallback mode (Corrective RAG). "
             "The user's documents were not relevant enough, so answer using ONLY "
             "the web search results below. Be concise and factual. "
-            "Cite sources by page title. If results are insufficient, say so."
+            "Cite sources by page title. If results are insufficient, say so. "
+            "Format in Markdown: headings, **bold**, and bullet/numbered lists. "
+            "Do not wrap the whole answer in a code fence."
         ),
         "fallback_text": None,
     }
@@ -233,14 +276,12 @@ def build_prompt(state: ChatState) -> dict[str, Any]:
                 "content": turn["content"],
             }
         )
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                f"Context:\n{state.get('context') or ''}\n\n"
-                f"Question: {state['question']}\n\n"
-                "Answer:"
-            ),
-        }
+    question = state["question"]
+    context = (state.get("context") or "").strip()
+    user_content = (
+        f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+        if context
+        else f"Question: {question}\n\nAnswer:"
     )
+    messages.append({"role": "user", "content": user_content})
     return {"messages": messages}

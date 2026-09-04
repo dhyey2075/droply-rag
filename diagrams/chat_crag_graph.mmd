@@ -5,6 +5,8 @@ config:
 ---
 graph TD;
 	__start__([<p>__start__</p>]):::first
+	route_intent(route_intent)
+	prepare_direct(prepare_direct)
 	embed_query(embed_query)
 	retrieve(retrieve)
 	grade_documents(grade_documents)
@@ -14,14 +16,17 @@ graph TD;
 	prepare_web(prepare_web)
 	build_prompt(build_prompt)
 	__end__([<p>__end__</p>]):::last
-	__start__ --> embed_query;
+	__start__ --> route_intent;
 	embed_query --> retrieve;
 	grade_documents -.-> prepare_documents;
 	grade_documents -.-> refine_query;
+	prepare_direct --> build_prompt;
 	prepare_documents --> build_prompt;
 	prepare_web --> build_prompt;
 	refine_query --> web_search;
 	retrieve --> grade_documents;
+	route_intent -.-> embed_query;
+	route_intent -.-> prepare_direct;
 	web_search --> prepare_web;
 	build_prompt --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2

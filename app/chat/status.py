@@ -6,6 +6,7 @@ from typing import Any
 
 _STEP_MESSAGES: dict[str, str] = {
     "start": "Understanding your question…",
+    "route_intent": "Checking whether your documents are needed…",
     "embed_query": "Searching your documents…",
     "retrieve": "Checking which passages matter…",
     "grade_documents": "Preparing an answer from your files…",
@@ -20,6 +21,7 @@ _STEP_MESSAGES: dict[str, str] = {
 
 GRAPH_STATUS_STEPS = frozenset(
     {
+        "route_intent",
         "embed_query",
         "retrieve",
         "grade_documents",
@@ -33,6 +35,8 @@ GRAPH_STATUS_STEPS = frozenset(
 
 
 def status_message_for(step: str, state: dict[str, Any] | None = None) -> str:
+    if step == "route_intent" and state and state.get("intent") == "direct":
+        return "Replying…"
     if step == "grade_documents" and state and state.get("use_web"):
         custom = state.get("meta_message")
         if isinstance(custom, str) and custom.strip():
