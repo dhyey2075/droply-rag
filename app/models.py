@@ -7,19 +7,6 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-class IngestRequest(BaseModel):
-    file_id: str
-    user_id: str
-    file_url: str
-    file_name: str
-    mime_or_type: str | None = None
-
-
-class IngestResponse(BaseModel):
-    status: str = "ok"
-    chunk_count: int
-
-
 class ChatHistoryItem(BaseModel):
     role: Literal["user", "assistant"]
     content: str

@@ -13,6 +13,7 @@ COPY main.py .
 COPY app ./app
 
 ENV PORT=8001
+ENV PYTHONUNBUFFERED=1
 EXPOSE 8001
 
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]

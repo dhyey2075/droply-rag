@@ -13,4 +13,6 @@ langgraph>=0.2.0
 pypdf>=5.0.0
 docx2txt>=0.8
 ddgs>=9.0.0
+bullmq>=2.16.0
+redis>=5.0.0
 

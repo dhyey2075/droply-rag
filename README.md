@@ -1,6 +1,6 @@
 # Droply RAG
 
-Internal FastAPI service that powers document Q&A for Droply. It ingests user files, embeds chunks with Gemini, stores vectors in Postgres (`pgvector`), and answers questions over a user's library with Groq — streamed via Server-Sent Events (SSE).
+Internal FastAPI **chat** service for Droply. Document indexing does **not** run in this process — a separate BullMQ worker (`python -m app.ingest.worker`) consumes Redis jobs and runs the ingest LangGraph. This HTTP server only answers questions over already-indexed chunks (Groq + pgvector), streamed via SSE.
 
 ## Stack
 
@@ -16,7 +16,7 @@ Internal FastAPI service that powers document Q&A for Droply. It ingests user fi
 
 ## Architecture
 
-Pipelines are modular LangGraph nodes. FastAPI only handles HTTP/SSE.
+Pipelines are modular LangGraph nodes. **FastAPI only serves chat.** Indexing runs in a separate worker process.
 
 ### Chat (CRAG)
 
@@ -30,7 +30,13 @@ embed_query → retrieve → grade_documents
 
 ![Chat CRAG LangGraph](diagrams/chat_crag_graph.png)
 
-### Ingest
+### Ingest (worker process, not this HTTP server)
+
+```text
+validate → download → parse → chunk → embed_docs → upsert
+```
+
+Run: `python -m app.ingest.worker` (same Redis queues Droply enqueues to).
 
 ```text
 validate → download → parse → chunk → embed_docs → upsert
@@ -50,7 +56,7 @@ Outputs land in `diagrams/`:
 
 ## Features
 
-- Download and chunk documents from a signed/public URL
+- Download and chunk documents from a signed/public URL (**worker**, not the API)
 - Upsert embeddings into `document_chunks` (scoped by `user_id` + `file_id`)
 - Similarity retrieval across a user's full indexed library (optional `file_ids` scope)
 - **Corrective RAG (CRAG):** LLM relevance grading of retrieved chunks; if all score below the threshold, fall back to web search
@@ -62,6 +68,7 @@ Outputs land in `diagrams/`:
 
 - Python 3.12+
 - PostgreSQL with the [`pgvector`](https://github.com/pgvector/pgvector) extension
+- Redis (for the indexing worker)
 - API keys for Gemini and Groq
 
 ## Setup
@@ -94,12 +101,22 @@ Fill in `.env` before starting the service.
 | `CRAG_ENABLED` | No | Enable Corrective RAG web fallback (default: `1`) |
 | `CRAG_RELEVANCE_THRESHOLD` | No | Min chunk relevance % to keep docs (default: `50`) |
 | `WEB_SEARCH_RESULTS` | No | Web results to fetch on fallback (default: `5`) |
+| `REDIS_URL` | Yes (worker) | Redis URL for BullMQ (`indexing` / `indexing-dlq`) |
+| `APP_URL` | No | Droply app origin for indexing SSE (default: `http://localhost:3000`) |
+| `INDEX_CONCURRENCY` | No | Max parallel ingests (default: `3`) |
+| `INDEX_CONCURRENCY_PER_USER` | No | Max parallel ingests per user (default: `2`) |
 | `PORT` | No | Listen port for Docker / Procfile (default: `8001`) |
 
 ## Run locally
 
 ```bash
 uvicorn main:app --reload --port 8001
+```
+
+Indexing worker (separate terminal, same venv):
+
+```bash
+python -m app.ingest.worker
 ```
 
 Health check:
@@ -131,30 +148,7 @@ Public health probe.
 { "status": "ok" }
 ```
 
-### `POST /ingest`
-
-Download a file, chunk it, embed, and upsert vectors for that `file_id` (existing chunks for the same file are replaced).
-
-**Request**
-
-```json
-{
-  "file_id": "uuid",
-  "user_id": "clerk_user_id",
-  "file_url": "https://...",
-  "file_name": "report.pdf",
-  "mime_or_type": "application/pdf"
-}
-```
-
-**Response**
-
-```json
-{
-  "status": "ok",
-  "chunk_count": 42
-}
-```
+There is **no** `/ingest` HTTP endpoint. Indexing is performed only by `python -m app.ingest.worker`.
 
 ### `POST /chat`
 
@@ -203,7 +197,7 @@ curl -N http://localhost:8001/chat \
 
 ```text
 droply-rag/
-├── main.py                 # FastAPI shell (/health, /ingest, /chat)
+├── main.py                 # FastAPI shell (/health, /chat)
 ├── app/
 │   ├── config.py
 │   ├── auth.py
@@ -211,15 +205,12 @@ droply-rag/
 │   ├── clients.py
 │   ├── sse.py
 │   ├── chat/               # CRAG LangGraph
-│   │   ├── state.py
+│   ├── ingest/             # Ingest LangGraph + BullMQ worker
+│   │   ├── worker.py       # python -m app.ingest.worker
+│   │   ├── jobs.py
+│   │   ├── graph.py
 │   │   ├── nodes.py
-│   │   ├── routing.py
-│   │   └── graph.py
-│   ├── ingest/             # Linear ingest LangGraph
-│   │   ├── state.py
-│   │   ├── loaders.py
-│   │   ├── nodes.py
-│   │   └── graph.py
+│   │   └── loaders.py
 │   ├── retrieval/          # embeddings, pgvector, sources
 │   ├── grading/            # CRAG relevance grader
 │   └── search/             # DDGS web fallback

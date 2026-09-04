@@ -1,4 +1,4 @@
-"""Droply RAG FastAPI shell — LangGraph pipelines live under app/."""
+"""Droply RAG FastAPI shell — chat only. Indexing runs in app.ingest.worker."""
 
 from __future__ import annotations
 
@@ -12,33 +12,15 @@ from app.chat.graph import chat_graph
 from app.chat.status import GRAPH_STATUS_STEPS, status_message_for
 from app.clients import get_groq_client
 from app.config import CHAT_MODEL
-from app.ingest.graph import ingest_graph
-from app.models import ChatRequest, IngestRequest, IngestResponse
+from app.models import ChatRequest
 from app.sse import sse
 
-app = FastAPI(title="Droply RAG", version="0.3.0")
+app = FastAPI(title="Droply RAG", version="0.4.0")
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
-
-
-@app.post("/ingest", response_model=IngestResponse)
-def ingest(
-    payload: IngestRequest,
-    _: None = Depends(require_internal_key),
-) -> IngestResponse:
-    result = ingest_graph.invoke(
-        {
-            "file_id": payload.file_id,
-            "user_id": payload.user_id,
-            "file_url": payload.file_url,
-            "file_name": payload.file_name,
-            "mime_or_type": payload.mime_or_type,
-        }
-    )
-    return IngestResponse(status="ok", chunk_count=int(result.get("chunk_count") or 0))
 
 
 @app.post("/chat")

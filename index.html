@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<body>
+
+<h3>Live Events</h3>
+<div id="output"></div>
+
+<script>
+    const source = new EventSource("http://localhost:8000/events");
+
+    source.onmessage = (event) => {
+        console.log(event);
+        const data = JSON.parse(event.data);
+        if(data.event === "message") {
+            document.getElementById("output").innerHTML +=
+                `<p>Message: ${data.id}: ${data.value}</p>`;
+        } else if(data.event === "notification") {
+            document.getElementById("output").innerHTML +=
+                `<p>Notification: ${data.id}: ${data.value}</p>`;
+        }
+
+        document.getElementById("output").innerHTML +=
+            `<p>${data.id}: ${data.value}</p>`;
+    };
+</script>
+
+</body>
+</html>
